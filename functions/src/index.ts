@@ -9,7 +9,11 @@
 
 import { setGlobalOptions } from "firebase-functions";
 import { onRequest } from "firebase-functions/https";
+import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
+
+const spotifyClientId = defineSecret("SPOTIFY_CLIENT_ID");
+const spotifyClientSecret = defineSecret("SPOTIFY_CLIENT_SECRET");
 
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
@@ -30,3 +34,47 @@ export const helloWorld = onRequest((request, response) => {
   logger.info("Hello logs!", { structuredData: true });
   response.send("Hello from Firebase!");
 });
+
+export const getSpotifyToken = onRequest(
+  { secrets: [spotifyClientId, spotifyClientSecret] },
+  async (request, response) => {
+    try {
+      const credentials = Buffer.from(
+        `${spotifyClientId.value()}:${spotifyClientSecret.value()}`,
+      ).toString("base64");
+
+      const tokenResponse = await fetch(
+        "https://accounts.spotify.com/api/token",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Basic ${credentials}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "grant_type=client_credentials",
+        },
+      );
+
+      if (!tokenResponse.ok) {
+        const errorBody = await tokenResponse.text();
+        logger.error("Spotify token request failed", {
+          status: tokenResponse.status,
+          body: errorBody,
+        });
+        response.status(502).send("Failed to obtain Spotify token");
+        return;
+      }
+
+      const data = (await tokenResponse.json()) as {
+        access_token: string;
+        token_type: string;
+        expires_in: number;
+      };
+
+      response.json(data);
+    } catch (error) {
+      logger.error("Unexpected error fetching Spotify token", error);
+      response.status(500).send("Internal error");
+    }
+  },
+);
