@@ -11,6 +11,11 @@ import { setGlobalOptions } from "firebase-functions";
 import { onRequest } from "firebase-functions/https";
 import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
+import { initializeApp } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
+
+initializeApp();
+const db = getFirestore();
 
 const spotifyClientId = defineSecret("SPOTIFY_CLIENT_ID");
 const spotifyClientSecret = defineSecret("SPOTIFY_CLIENT_SECRET");
@@ -35,6 +40,27 @@ export const helloWorld = onRequest((request, response) => {
   response.send("Hello from Firebase!");
 });
 
+/**
+ * Public HTTPS endpoint that exchanges this app's Spotify client credentials
+ * for a short-lived API access token using Spotify's Client Credentials flow.
+ * The client ID and secret are stored as Firebase secrets and injected at
+ * runtime; the token returned is suitable for calling public Spotify Web API
+ * endpoints (search, track lookup, etc.) that don't require user-level auth.
+ *
+ * Request:
+ *   GET /getSpotifyToken
+ *   (no parameters or body required)
+ *
+ * Response (200):
+ *   {
+ *     "access_token": "BQDx...redacted...",
+ *     "token_type": "Bearer",
+ *     "expires_in": 3600
+ *   }
+ *
+ * Returns 502 if Spotify rejects the credentials request, and 500 for any
+ * other unexpected error.
+ */
 export const getSpotifyToken = onRequest(
   { secrets: [spotifyClientId, spotifyClientSecret] },
   async (request, response) => {
@@ -78,3 +104,80 @@ export const getSpotifyToken = onRequest(
     }
   },
 );
+
+type DuplicateMatch = {
+  created: string;
+  roundName: string;
+  submitterName: string;
+};
+
+/**
+ * Public HTTPS endpoint (POST only) that checks whether a given Spotify track
+ * has already been submitted in a previous round. It queries the `songs`
+ * collection for documents whose `spotifyUri` matches the request payload and
+ * returns the `created`, `roundName`, and `submitterName` for each match,
+ * sorted with the most recently created submission first.
+ *
+ * Request:
+ *   POST /duplicateCheck
+ *   Content-Type: application/json
+ *   {
+ *     "spotifyUri": "spotify:track:4cOdK2wGLETKBW3PvgPWqT"
+ *   }
+ *
+ * Response (200):
+ *   {
+ *     "matches": [
+ *       {
+ *         "created": "2024-11-02T18:12:04Z",
+ *         "roundName": "Round 14",
+ *         "submitterName": "Tyler"
+ *       },
+ *       {
+ *         "created": "2023-07-26T15:33:28Z",
+ *         "roundName": "Round 3",
+ *         "submitterName": "Sam"
+ *       }
+ *     ]
+ *   }
+ *
+ * Returns an empty `matches` array when the song has not been submitted before.
+ * Returns 400 if `spotifyUri` is missing, and 405 for any non-POST method.
+ */
+export const duplicateCheck = onRequest(async (request, response) => {
+  try {
+    if (request.method !== "POST") {
+      response.set("Allow", "POST");
+      response.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const spotifyUri = request.body?.spotifyUri as string | undefined;
+
+    if (!spotifyUri || typeof spotifyUri !== "string") {
+      response.status(400).json({ error: "spotifyUri is required" });
+      return;
+    }
+
+    const snapshot = await db
+      .collection("songs")
+      .where("spotifyUri", "==", spotifyUri)
+      .get();
+
+    const matches: DuplicateMatch[] = snapshot.docs
+      .map((doc) => {
+        const data = doc.data();
+        return {
+          created: data.created as string,
+          roundName: data.roundName as string,
+          submitterName: data.submitterName as string,
+        };
+      })
+      .sort((a, b) => b.created.localeCompare(a.created));
+
+    response.json({ matches });
+  } catch (error) {
+    logger.error("duplicateCheck failed", error);
+    response.status(500).send("Internal error");
+  }
+});
