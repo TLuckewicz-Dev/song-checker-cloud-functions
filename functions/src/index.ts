@@ -13,12 +13,24 @@ import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import cors from "cors";
 
 initializeApp();
 const db = getFirestore();
 
 const spotifyClientId = defineSecret("SPOTIFY_CLIENT_ID");
 const spotifyClientSecret = defineSecret("SPOTIFY_CLIENT_SECRET");
+
+// Origins allowed to call these functions from a browser. Update this list
+// when adding new frontend domains (production, preview channels, custom
+// domains, etc.). Same-origin / non-browser callers are unaffected.
+const corsHandler = cors({
+  origin: [
+    "https://song-checker-5a454.web.app",
+    "https://song-checker-5a454.firebaseapp.com",
+    "http://localhost:5173",
+  ],
+});
 
 // Start writing functions
 // https://firebase.google.com/docs/functions/typescript
@@ -36,8 +48,10 @@ const spotifyClientSecret = defineSecret("SPOTIFY_CLIENT_SECRET");
 setGlobalOptions({ maxInstances: 10 });
 
 export const helloWorld = onRequest((request, response) => {
-  logger.info("Hello logs!", { structuredData: true });
-  response.send("Hello from Firebase!");
+  corsHandler(request, response, () => {
+    logger.info("Hello logs!", { structuredData: true });
+    response.send("Hello from Firebase!");
+  });
 });
 
 /**
@@ -63,45 +77,47 @@ export const helloWorld = onRequest((request, response) => {
  */
 export const getSpotifyToken = onRequest(
   { secrets: [spotifyClientId, spotifyClientSecret] },
-  async (request, response) => {
-    try {
-      const credentials = Buffer.from(
-        `${spotifyClientId.value()}:${spotifyClientSecret.value()}`,
-      ).toString("base64");
+  (request, response) => {
+    corsHandler(request, response, async () => {
+      try {
+        const credentials = Buffer.from(
+          `${spotifyClientId.value()}:${spotifyClientSecret.value()}`,
+        ).toString("base64");
 
-      const tokenResponse = await fetch(
-        "https://accounts.spotify.com/api/token",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Basic ${credentials}`,
-            "Content-Type": "application/x-www-form-urlencoded",
+        const tokenResponse = await fetch(
+          "https://accounts.spotify.com/api/token",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Basic ${credentials}`,
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: "grant_type=client_credentials",
           },
-          body: "grant_type=client_credentials",
-        },
-      );
+        );
 
-      if (!tokenResponse.ok) {
-        const errorBody = await tokenResponse.text();
-        logger.error("Spotify token request failed", {
-          status: tokenResponse.status,
-          body: errorBody,
-        });
-        response.status(502).send("Failed to obtain Spotify token");
-        return;
+        if (!tokenResponse.ok) {
+          const errorBody = await tokenResponse.text();
+          logger.error("Spotify token request failed", {
+            status: tokenResponse.status,
+            body: errorBody,
+          });
+          response.status(502).send("Failed to obtain Spotify token");
+          return;
+        }
+
+        const data = (await tokenResponse.json()) as {
+          access_token: string;
+          token_type: string;
+          expires_in: number;
+        };
+
+        response.json(data);
+      } catch (error) {
+        logger.error("Unexpected error fetching Spotify token", error);
+        response.status(500).send("Internal error");
       }
-
-      const data = (await tokenResponse.json()) as {
-        access_token: string;
-        token_type: string;
-        expires_in: number;
-      };
-
-      response.json(data);
-    } catch (error) {
-      logger.error("Unexpected error fetching Spotify token", error);
-      response.status(500).send("Internal error");
-    }
+    });
   },
 );
 
@@ -144,40 +160,42 @@ type DuplicateMatch = {
  * Returns an empty `matches` array when the song has not been submitted before.
  * Returns 400 if `spotifyUri` is missing, and 405 for any non-POST method.
  */
-export const duplicateCheck = onRequest(async (request, response) => {
-  try {
-    if (request.method !== "POST") {
-      response.set("Allow", "POST");
-      response.status(405).json({ error: "Method not allowed" });
-      return;
+export const duplicateCheck = onRequest((request, response) => {
+  corsHandler(request, response, async () => {
+    try {
+      if (request.method !== "POST") {
+        response.set("Allow", "POST");
+        response.status(405).json({ error: "Method not allowed" });
+        return;
+      }
+
+      const spotifyUri = request.body?.spotifyUri as string | undefined;
+
+      if (!spotifyUri || typeof spotifyUri !== "string") {
+        response.status(400).json({ error: "spotifyUri is required" });
+        return;
+      }
+
+      const snapshot = await db
+        .collection("songs")
+        .where("spotifyUri", "==", spotifyUri)
+        .get();
+
+      const matches: DuplicateMatch[] = snapshot.docs
+        .map((doc) => {
+          const data = doc.data();
+          return {
+            created: data.created as string,
+            roundName: data.roundName as string,
+            submitterName: data.submitterName as string,
+          };
+        })
+        .sort((a, b) => b.created.localeCompare(a.created));
+
+      response.json({ matches });
+    } catch (error) {
+      logger.error("duplicateCheck failed", error);
+      response.status(500).send("Internal error");
     }
-
-    const spotifyUri = request.body?.spotifyUri as string | undefined;
-
-    if (!spotifyUri || typeof spotifyUri !== "string") {
-      response.status(400).json({ error: "spotifyUri is required" });
-      return;
-    }
-
-    const snapshot = await db
-      .collection("songs")
-      .where("spotifyUri", "==", spotifyUri)
-      .get();
-
-    const matches: DuplicateMatch[] = snapshot.docs
-      .map((doc) => {
-        const data = doc.data();
-        return {
-          created: data.created as string,
-          roundName: data.roundName as string,
-          submitterName: data.submitterName as string,
-        };
-      })
-      .sort((a, b) => b.created.localeCompare(a.created));
-
-    response.json({ matches });
-  } catch (error) {
-    logger.error("duplicateCheck failed", error);
-    response.status(500).send("Internal error");
-  }
+  });
 });
