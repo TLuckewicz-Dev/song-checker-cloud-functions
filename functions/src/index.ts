@@ -14,12 +14,17 @@ import * as logger from "firebase-functions/logger";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import cors from "cors";
+import OpenAI from "openai";
 
 initializeApp();
 const db = getFirestore();
 
 const spotifyClientId = defineSecret("SPOTIFY_CLIENT_ID");
 const spotifyClientSecret = defineSecret("SPOTIFY_CLIENT_SECRET");
+const openaiApiKey = defineSecret("OPENAI_API_KEY");
+
+const MAX_PROMPT_LENGTH = 4000;
+const ALLOWED_GROUP = "908beanbagboys";
 
 // Origins allowed to call these functions from a browser. Update this list
 // when adding new frontend domains (production, preview channels, custom
@@ -199,3 +204,98 @@ export const duplicateCheck = onRequest((request, response) => {
     }
   });
 });
+
+/**
+ * Public HTTPS endpoint (POST only) that forwards a single user prompt to the
+ * OpenAI Chat Completions API and returns the model's reply. This is intended
+ * for one-shot prompts; conversation history is not persisted between calls.
+ *
+ * The OpenAI API key is stored as a Firebase secret (`OPENAI_API_KEY`) and
+ * injected at runtime. Prompts longer than `MAX_PROMPT_LENGTH` are rejected to
+ * cap per-request token cost.
+ *
+ * Callers must include a `group` field matching `ALLOWED_GROUP`. This is a
+ * lightweight shared-secret gate intended to discourage incidental hits on
+ * the public URL; it is NOT a real authorization mechanism, since the value
+ * ships in the React client bundle. Replace with App Check or Firebase Auth
+ * when stronger guarantees are needed.
+ *
+ * Request:
+ *   POST /askOpenAI
+ *   Content-Type: application/json
+ *   {
+ *     "prompt": "Suggest three song recommendations similar to...",
+ *     "group": "908beanbagboys"
+ *   }
+ *
+ * Response (200):
+ *   {
+ *     "reply": "Here are three suggestions...",
+ *     "model": "gpt-4o-mini"
+ *   }
+ *
+ * Returns 400 if `prompt` is missing, not a string, or too long. Returns 403
+ * if `group` does not match the expected value. Returns 405 for any non-POST
+ * method, 502 if OpenAI rejects the request, and 500 for any other unexpected
+ * error.
+ */
+export const askOpenAI = onRequest(
+  { secrets: [openaiApiKey], timeoutSeconds: 60, maxInstances: 5 },
+  (request, response) => {
+    corsHandler(request, response, async () => {
+      try {
+        if (request.method !== "POST") {
+          response.set("Allow", "POST");
+          response.status(405).json({ error: "Method not allowed" });
+          return;
+        }
+
+        const group = request.body?.group as string | undefined;
+
+        if (group !== ALLOWED_GROUP) {
+          response.status(403).json({ error: "Forbidden" });
+          return;
+        }
+
+        const prompt = request.body?.prompt as string | undefined;
+
+        if (!prompt || typeof prompt !== "string") {
+          response.status(400).json({ error: "prompt is required" });
+          return;
+        }
+
+        if (prompt.length > MAX_PROMPT_LENGTH) {
+          response.status(400).json({
+            error: `prompt must be ${MAX_PROMPT_LENGTH} characters or fewer`,
+          });
+          return;
+        }
+
+        const client = new OpenAI({ apiKey: openaiApiKey.value() });
+        const model = "gpt-4o-mini";
+
+        const completion = await client.chat.completions.create({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 500,
+        });
+
+        const reply = completion.choices[0]?.message?.content ?? "";
+
+        response.json({ reply, model });
+      } catch (error) {
+        if (error instanceof OpenAI.APIError) {
+          logger.error("OpenAI API error", {
+            status: error.status,
+            message: error.message,
+          });
+          response.status(502).json({ error: "OpenAI request failed" });
+          return;
+        }
+
+        logger.error("askOpenAI failed", error);
+        response.status(500).send("Internal error");
+      }
+    });
+  },
+);
