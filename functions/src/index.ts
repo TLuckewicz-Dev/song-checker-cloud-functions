@@ -205,14 +205,143 @@ export const duplicateCheck = onRequest((request, response) => {
   });
 });
 
+type SongVote = {
+  comment?: string;
+  points?: number;
+  voterName?: string;
+};
+
+type SongDoc = {
+  album?: string;
+  artists?: string;
+  created?: string;
+  roundName?: string;
+  submitterComment?: string;
+  submitterName?: string;
+  title?: string;
+  totalPoints?: number;
+  votes?: SongVote[];
+};
+
+const CORPUS_HEADER =
+  "submitter|round|date|title|artist|album|points|comment|votes";
+
+// How long the in-memory corpus snapshot is reused across invocations of the
+// same warm container. New songs submitted within this window won't appear in
+// the prompt until the cache expires.
+const CORPUS_TTL_MS = 5 * 60 * 1000;
+
+let corpusCache: { value: string; fetchedAt: number } | null = null;
+
+/**
+ * Strips characters that would break the pipe-delimited row format. Newlines
+ * and pipes are replaced with a single space; everything else is left alone.
+ *
+ * @param {string} value Raw field value from a Firestore document.
+ * @return {string} Sanitized value safe to embed in a pipe-delimited row.
+ */
+function sanitizeField(value: string): string {
+  return value.replace(/[|\r\n]+/g, " ").trim();
+}
+
+/**
+ * Renders a single vote as `Voter:+N` (or `Voter:-N`), appending the voter's
+ * comment in parentheses when present.
+ *
+ * @param {SongVote} vote A vote entry from a song document.
+ * @return {string} Compact pipe-row representation of the vote.
+ */
+function formatVote(vote: SongVote): string {
+  const name = sanitizeField(vote.voterName ?? "?");
+  const points = vote.points ?? 0;
+  const sign = points >= 0 ? "+" : "";
+  const base = `${name}:${sign}${points}`;
+  const comment = sanitizeField(vote.comment ?? "");
+  return comment ? `${base} ("${comment}")` : base;
+}
+
+/**
+ * Renders one Firestore `songs` document as a single pipe-delimited row whose
+ * column order matches `CORPUS_HEADER`.
+ *
+ * @param {SongDoc} doc A document from the `songs` collection.
+ * @return {string} A single pipe-delimited row.
+ */
+function formatSongRow(doc: SongDoc): string {
+  const date = (doc.created ?? "").slice(0, 10);
+  const votes = (doc.votes ?? []).map(formatVote).join(",");
+  return [
+    sanitizeField(doc.submitterName ?? ""),
+    sanitizeField(doc.roundName ?? ""),
+    date,
+    sanitizeField(doc.title ?? ""),
+    sanitizeField(doc.artists ?? ""),
+    sanitizeField(doc.album ?? ""),
+    String(doc.totalPoints ?? 0),
+    sanitizeField(doc.submitterComment ?? ""),
+    votes,
+  ].join("|");
+}
+
+/**
+ * Fetches every document in the `songs` collection (ordered by submission
+ * date) and renders them as a pipe-delimited table with a header row.
+ */
+async function buildSongCorpus(): Promise<string> {
+  const snapshot = await db.collection("songs").orderBy("created", "asc").get();
+  const rows = snapshot.docs.map((d) => formatSongRow(d.data() as SongDoc));
+  return [CORPUS_HEADER, ...rows].join("\n");
+}
+
+/**
+ * Returns a cached pipe-delimited dump of every song document, refreshing at
+ * most once per `CORPUS_TTL_MS`. Keeping the corpus stable across calls allows
+ * OpenAI's automatic prompt caching to discount the (large) system-message
+ * prefix on repeat invocations.
+ */
+async function getSongCorpus(): Promise<string> {
+  if (corpusCache && Date.now() - corpusCache.fetchedAt < CORPUS_TTL_MS) {
+    return corpusCache.value;
+  }
+  const value = await buildSongCorpus();
+  corpusCache = { value, fetchedAt: Date.now() };
+  return value;
+}
+
+const ASK_OPENAI_SYSTEM_PROMPT = [
+  "You are a music analyst for a friend group that runs themed song-submission rounds.",
+  "The pipe-delimited table below contains every song ever submitted, including votes from group members.",
+  "",
+  "Columns: submitter|round|date|title|artist|album|points|comment|votes",
+  '- "points" is the total score across all voters and can be negative.',
+  '- "comment" is the submitter\'s note (often empty).',
+  '- "votes" is a comma-separated list in the form Voter:\u00b1N, optionally followed by a comment in parentheses.',
+  "",
+  "When asked about genre, mood, or stylistic patterns, infer from the artist, album, and title using your own knowledge of music.",
+  "Treat the table as authoritative for who submitted or voted on what; use your music knowledge for genre, era, and sound.",
+  "Be specific and cite songs or submitters when relevant. If the data does not support an answer, say so rather than guessing.",
+  "",
+  "DATA:",
+].join("\n");
+
 /**
  * Public HTTPS endpoint (POST only) that forwards a single user prompt to the
- * OpenAI Chat Completions API and returns the model's reply. This is intended
- * for one-shot prompts; conversation history is not persisted between calls.
+ * OpenAI Chat Completions API and returns the model's reply. Every call
+ * injects a pipe-delimited dump of the `songs` Firestore collection (title,
+ * artist, album, submitter, round, date, points, submitter comment, and
+ * per-voter scores/comments) as system context, so the model can answer
+ * questions about the group's submission history.
  *
  * The OpenAI API key is stored as a Firebase secret (`OPENAI_API_KEY`) and
- * injected at runtime. Prompts longer than `MAX_PROMPT_LENGTH` are rejected to
- * cap per-request token cost.
+ * injected at runtime. User prompts longer than `MAX_PROMPT_LENGTH` are
+ * rejected to cap per-request token cost; the song corpus itself is bounded
+ * only by Firestore size and the model's context window (~128k tokens for
+ * `gpt-4o-mini`, which fits a few thousand songs in this format).
+ *
+ * The corpus is built once per warm container and cached for `CORPUS_TTL_MS`
+ * to avoid 800+ Firestore reads on every invocation and to maximize OpenAI
+ * prompt-cache hit rate (identical system messages get discounted input
+ * pricing).
  *
  * Callers must include a `group` field matching `ALLOWED_GROUP`. This is a
  * lightweight shared-secret gate intended to discourage incidental hits on
@@ -224,13 +353,13 @@ export const duplicateCheck = onRequest((request, response) => {
  *   POST /askOpenAI
  *   Content-Type: application/json
  *   {
- *     "prompt": "Suggest three song recommendations similar to...",
+ *     "prompt": "What genre does Alex submit the most?",
  *     "group": "908beanbagboys"
  *   }
  *
  * Response (200):
  *   {
- *     "reply": "Here are three suggestions...",
+ *     "reply": "Based on his submissions, Alex leans heavily indie rock...",
  *     "model": "gpt-4o-mini"
  *   }
  *
@@ -240,7 +369,7 @@ export const duplicateCheck = onRequest((request, response) => {
  * error.
  */
 export const askOpenAI = onRequest(
-  { secrets: [openaiApiKey], timeoutSeconds: 60, maxInstances: 5 },
+  { secrets: [openaiApiKey], timeoutSeconds: 120, maxInstances: 5 },
   (request, response) => {
     corsHandler(request, response, async () => {
       try {
@@ -271,13 +400,25 @@ export const askOpenAI = onRequest(
           return;
         }
 
+        const corpus = await getSongCorpus();
+        logger.info("askOpenAI corpus prepared", {
+          corpusChars: corpus.length,
+          cached: !!corpusCache,
+        });
+
         const client = new OpenAI({ apiKey: openaiApiKey.value() });
         const model = "gpt-4o-mini";
 
         const completion = await client.chat.completions.create({
           model,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 500,
+          messages: [
+            {
+              role: "system",
+              content: `${ASK_OPENAI_SYSTEM_PROMPT}\n${corpus}`,
+            },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: 800,
         });
 
         const reply = completion.choices[0]?.message?.content ?? "";
