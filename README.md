@@ -119,6 +119,10 @@ Expected response:
 
 ## Call `getSpotifyToken` From Postman
 
+`getSpotifyToken` exchanges this app's Spotify client credentials for a short-lived API access token using Spotify's Client Credentials flow. The returned token can be used as a Bearer token against the public Spotify Web API.
+
+Calls must include a `group` field matching the expected group value (currently `908beanbagboys`). This is a lightweight shared-secret gate — not a real authorization mechanism — intended to discourage incidental hits on the public URL.
+
 ### Local emulator URL
 
 - `http://127.0.0.1:5001/song-checker-5a454/us-central1/getSpotifyToken`
@@ -129,10 +133,17 @@ Expected response:
 
 ### Request setup in Postman
 
-- Method: `GET`
+- Method: `POST` (any other method returns `405 Method Not Allowed`)
 - URL: use either the local emulator URL or deployed URL above
-- Body: none
-- Headers: none required
+- Headers:
+  - `Content-Type: application/json`
+- Body — select **raw** + **JSON** and paste:
+
+```json
+{
+  "group": "908beanbagboys"
+}
+```
 
 Expected response (JSON):
 
@@ -145,6 +156,11 @@ Expected response (JSON):
 ```
 
 The token is valid for `expires_in` seconds (typically 3600) and can be used as a Bearer token against the Spotify Web API.
+
+Error responses:
+
+- `403` with `{"error": "Forbidden"}` if `group` does not match.
+- `502` with `Failed to obtain Spotify token` if the upstream Spotify call returns an error.
 
 ## Call `duplicateCheck` From Postman
 

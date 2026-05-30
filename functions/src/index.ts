@@ -60,15 +60,25 @@ export const helloWorld = onRequest((request, response) => {
 });
 
 /**
- * Public HTTPS endpoint that exchanges this app's Spotify client credentials
- * for a short-lived API access token using Spotify's Client Credentials flow.
- * The client ID and secret are stored as Firebase secrets and injected at
- * runtime; the token returned is suitable for calling public Spotify Web API
- * endpoints (search, track lookup, etc.) that don't require user-level auth.
+ * Public HTTPS endpoint (POST only) that exchanges this app's Spotify client
+ * credentials for a short-lived API access token using Spotify's Client
+ * Credentials flow. The client ID and secret are stored as Firebase secrets
+ * and injected at runtime; the token returned is suitable for calling public
+ * Spotify Web API endpoints (search, track lookup, etc.) that don't require
+ * user-level auth.
+ *
+ * Callers must include a `group` field matching `ALLOWED_GROUP`. This is a
+ * lightweight shared-secret gate intended to discourage incidental hits on
+ * the public URL; it is NOT a real authorization mechanism, since the value
+ * ships in the React client bundle. Replace with App Check or Firebase Auth
+ * when stronger guarantees are needed.
  *
  * Request:
- *   GET /getSpotifyToken
- *   (no parameters or body required)
+ *   POST /getSpotifyToken
+ *   Content-Type: application/json
+ *   {
+ *     "group": "908beanbagboys"
+ *   }
  *
  * Response (200):
  *   {
@@ -77,14 +87,28 @@ export const helloWorld = onRequest((request, response) => {
  *     "expires_in": 3600
  *   }
  *
- * Returns 502 if Spotify rejects the credentials request, and 500 for any
- * other unexpected error.
+ * Returns 403 if `group` does not match the expected value. Returns 405 for
+ * any non-POST method, 502 if Spotify rejects the credentials request, and
+ * 500 for any other unexpected error.
  */
 export const getSpotifyToken = onRequest(
   { secrets: [spotifyClientId, spotifyClientSecret] },
   (request, response) => {
     corsHandler(request, response, async () => {
       try {
+        if (request.method !== "POST") {
+          response.set("Allow", "POST");
+          response.status(405).json({ error: "Method not allowed" });
+          return;
+        }
+
+        const group = request.body?.group as string | undefined;
+
+        if (group !== ALLOWED_GROUP) {
+          response.status(403).json({ error: "Forbidden" });
+          return;
+        }
+
         const credentials = Buffer.from(
           `${spotifyClientId.value()}:${spotifyClientSecret.value()}`,
         ).toString("base64");
